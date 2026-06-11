@@ -3,6 +3,7 @@ from exp.exp_basic import Exp_Basic
 from models import Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST
 from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
 from utils.metrics import metric
+from utils.sam import SAM, enable_running_stats, disable_running_stats
 
 import numpy as np
 import torch
@@ -44,12 +45,41 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        if self.args.use_sam:
+            model_optim = SAM(
+                self.model.parameters(),
+                base_optimizer=optim.Adam,
+                rho=self.args.rho,
+                adaptive=self.args.adaptive_sam,
+                lr=self.args.learning_rate,
+            )
+            print(f'Using SAM optimizer (rho={self.args.rho}, '
+                  f'adaptive={self.args.adaptive_sam}) wrapping Adam '
+                  f'(lr={self.args.learning_rate})')
+        else:
+            model_optim = optim.Adam(
+                self.model.parameters(), lr=self.args.learning_rate
+            )
         return model_optim
 
     def _select_criterion(self):
         criterion = nn.MSELoss()
         return criterion
+
+    def _is_linear_or_tst(self):
+        """Check if the model is a direct-output model (no decoder input)."""
+        return 'Linear' in self.args.model or 'TST' in self.args.model
+
+    def _forward(self, batch_x, batch_x_mark, dec_inp, batch_y_mark):
+        """Unified forward pass that handles all model types."""
+        if self._is_linear_or_tst():
+            outputs = self.model(batch_x)
+        else:
+            if self.args.output_attention:
+                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+            else:
+                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+        return outputs
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
@@ -116,12 +146,21 @@ class Exp_Main(Exp_Basic):
 
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
-            
-        scheduler = lr_scheduler.OneCycleLR(optimizer = model_optim,
-                                            steps_per_epoch = train_steps,
-                                            pct_start = self.args.pct_start,
-                                            epochs = self.args.train_epochs,
-                                            max_lr = self.args.learning_rate)
+
+        # ---- LR Scheduler ------------------------------------------------
+        # When SAM wraps Adam, the OneCycleLR must target the *inner* Adam
+        # optimizer (base_optimizer).  SAM aliases param_groups so the LR
+        # values propagate correctly.
+        scheduler_optim = (
+            model_optim.base_optimizer if self.args.use_sam else model_optim
+        )
+        scheduler = lr_scheduler.OneCycleLR(
+            optimizer=scheduler_optim,
+            steps_per_epoch=train_steps,
+            pct_start=self.args.pct_start,
+            epochs=self.args.train_epochs,
+            max_lr=self.args.learning_rate,
+        )
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -131,65 +170,89 @@ class Exp_Main(Exp_Basic):
             epoch_time = time.time()
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
-                model_optim.zero_grad()
-                batch_x = batch_x.float().to(self.device)
 
+                batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
+                # decoder input (used by encoder-decoder models)
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                dec_inp = torch.cat(
+                    [batch_y[:, :self.args.label_len, :], dec_inp], dim=1
+                ).float().to(self.device)
 
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
+                f_dim = -1 if self.args.features == 'MS' else 0
+
+                # ===========================================================
+                # SAM two-step training
+                # ===========================================================
+                if self.args.use_sam:
+                    loss = self._train_step_sam(
+                        batch_x, batch_y, batch_x_mark, batch_y_mark,
+                        dec_inp, f_dim, model_optim, criterion,
+                    )
+                    train_loss.append(loss)
+
+                # ===========================================================
+                # Standard training (original PatchTST code, unchanged)
+                # ===========================================================
+                else:
+                    model_optim.zero_grad()
+
+                    if self.args.use_amp:
+                        with torch.cuda.amp.autocast():
+                            if 'Linear' in self.args.model or 'TST' in self.args.model:
+                                outputs = self.model(batch_x)
+                            else:
+                                if self.args.output_attention:
+                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                                else:
+                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                            outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                            batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                            loss = criterion(outputs, batch_y)
+                            train_loss.append(loss.item())
+                    else:
                         if 'Linear' in self.args.model or 'TST' in self.args.model:
-                            outputs = self.model(batch_x)
+                                outputs = self.model(batch_x)
                         else:
                             if self.args.output_attention:
                                 outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                                
                             else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_y)
+                        # print(outputs.shape,batch_y.shape)
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
                         train_loss.append(loss.item())
-                else:
-                    if 'Linear' in self.args.model or 'TST' in self.args.model:
-                            outputs = self.model(batch_x)
-                    else:
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_y)
-                    # print(outputs.shape,batch_y.shape)
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
 
+                    if self.args.use_amp:
+                        scaler.scale(loss).backward()
+                        scaler.step(model_optim)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        model_optim.step()
+
+                # ===========================================================
+                # Logging (shared by both paths)
+                # ===========================================================
                 if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(
+                        i + 1, epoch + 1, train_loss[-1]))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
                     iter_count = 0
                     time_now = time.time()
 
-                if self.args.use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    model_optim.step()
-                    
+                # ===========================================================
+                # LR scheduling (shared by both paths)
+                # ===========================================================
                 if self.args.lradj == 'TST':
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
@@ -215,6 +278,78 @@ class Exp_Main(Exp_Basic):
         self.model.load_state_dict(torch.load(best_model_path))
 
         return self.model
+
+    # ===================================================================
+    # SAM training step — encapsulates the two forward-backward passes
+    # ===================================================================
+    def _train_step_sam(self, batch_x, batch_y, batch_x_mark, batch_y_mark,
+                        dec_inp, f_dim, model_optim, criterion):
+        """
+        Perform one SAM training iteration (two forward-backward passes).
+
+        Handles:
+          - AMP (autocast without GradScaler — SAM needs true gradient
+            magnitudes for the perturbation norm, so we skip GradScaler
+            to avoid the complexity of double-unscaling. autocast still
+            provides mixed-precision speedup for the forward pass.)
+          - BatchNorm running statistics: frozen during the second pass
+            so that running mean/var reflect the *original* (unperturbed)
+            weights only.
+
+        Returns:
+            float: loss value from the first forward pass (at θ, for logging).
+        """
+        # Trim targets to prediction horizon
+        batch_y_trimmed = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+        # ---- STEP 1: Forward-backward at θ, then ascend to θ̃ --------
+        #
+        # Enable running stats so BN updates mean/var from the
+        # *original* weight distribution.
+        enable_running_stats(self.model)
+        model_optim.zero_grad()
+
+        if self.args.use_amp:
+            # Use autocast for mixed-precision forward, but do NOT use
+            # GradScaler — SAM's first_step computes ε = ρ·∇L/‖∇L‖ and
+            # needs the true (unscaled) gradient magnitudes.
+            with torch.cuda.amp.autocast():
+                outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                loss = criterion(outputs, batch_y_trimmed)
+        else:
+            outputs = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            outputs = outputs[:, -self.args.pred_len:, f_dim:]
+            loss = criterion(outputs, batch_y_trimmed)
+
+        loss.backward()
+        model_optim.first_step(zero_grad=True)  # perturb: θ → θ̃
+
+        # ---- STEP 2: Forward-backward at θ̃, then update θ -----------
+        #
+        # Freeze BN running stats — the second forward pass uses
+        # perturbed weights θ̃ and we do NOT want those statistics
+        # polluting the running averages.
+        disable_running_stats(self.model)
+
+        if self.args.use_amp:
+            with torch.cuda.amp.autocast():
+                outputs_2 = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                outputs_2 = outputs_2[:, -self.args.pred_len:, f_dim:]
+                loss_2 = criterion(outputs_2, batch_y_trimmed)
+        else:
+            outputs_2 = self._forward(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            outputs_2 = outputs_2[:, -self.args.pred_len:, f_dim:]
+            loss_2 = criterion(outputs_2, batch_y_trimmed)
+
+        loss_2.backward()
+        model_optim.second_step(zero_grad=True)  # revert θ̃→θ, then step
+
+        # Restore normal BN behavior for the next iteration
+        enable_running_stats(self.model)
+
+        # Log the loss at the *original* weights (not the perturbed ones)
+        return loss.item()
 
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
