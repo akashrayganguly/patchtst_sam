@@ -33,10 +33,6 @@ if __name__ == '__main__':
     parser.add_argument('--label_len', type=int, default=48, help='start token length')
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
 
-
-    # DLinear
-    #parser.add_argument('--individual', action='store_true', default=False, help='DLinear: a linear layer for each variate(channel) individually')
-
     # PatchTST
     parser.add_argument('--fc_dropout', type=float, default=0.05, help='fully connected dropout')
     parser.add_argument('--head_dropout', type=float, default=0.0, help='head dropout')
@@ -50,9 +46,17 @@ if __name__ == '__main__':
     parser.add_argument('--kernel_size', type=int, default=25, help='decomposition-kernel')
     parser.add_argument('--individual', type=int, default=0, help='individual head; True 1 False 0')
 
+    # ---- Channel attention (from CT-PatchTST) ----
+    parser.add_argument('--channel_attn', type=int, default=0,
+                        help='Use channel attention instead of temporal attention in '
+                             'the PatchTST encoder.  0 = original temporal attention '
+                             '(default), 1 = channel-wise attention across variables '
+                             'at each patch position (CT-PatchTST style).  Requires '
+                             'features=M with enc_in > 1.')
+
     # Formers 
     parser.add_argument('--embed_type', type=int, default=0, help='0: default 1: value embedding + temporal embedding + positional embedding 2: value embedding + temporal embedding 3: value embedding + positional embedding 4: value embedding')
-    parser.add_argument('--enc_in', type=int, default=7, help='encoder input size') # DLinear with --individual, use this hyperparameter as the number of channels
+    parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
     parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
     parser.add_argument('--c_out', type=int, default=7, help='output size')
     parser.add_argument('--d_model', type=int, default=512, help='dimension of model')
@@ -85,6 +89,14 @@ if __name__ == '__main__':
     parser.add_argument('--pct_start', type=float, default=0.3, help='pct_start')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
+    # ---- SAM (Sharpness-Aware Minimization) ----
+    parser.add_argument('--use_sam', action='store_true', default=False,
+                        help='Use Sharpness-Aware Minimization (SAM) optimizer.')
+    parser.add_argument('--rho', type=float, default=0.5,
+                        help='SAM perturbation radius (default: 0.5)')
+    parser.add_argument('--adaptive_sam', action='store_true', default=False,
+                        help='Use Adaptive SAM (ASAM).')
+
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
@@ -100,7 +112,6 @@ if __name__ == '__main__':
     torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
 
-
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -109,8 +120,20 @@ if __name__ == '__main__':
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
 
+    # Validate channel_attn compatibility
+    if args.channel_attn and args.enc_in <= 1:
+        print('WARNING: --channel_attn requires enc_in > 1 (multivariate). '
+              'With enc_in=1, channel attention is a no-op. Falling back to '
+              'temporal attention.')
+        args.channel_attn = 0
+
     print('Args in experiment:')
     print(args)
+
+    if args.channel_attn:
+        print(f'\n*** Channel attention ENABLED (enc_in={args.enc_in} channels) ***')
+    if args.use_sam:
+        print(f'*** SAM enabled: rho={args.rho}, adaptive={args.adaptive_sam} ***\n')
 
     Exp = Exp_Main
 
@@ -170,4 +193,3 @@ if __name__ == '__main__':
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         exp.test(setting, test=1)
         torch.cuda.empty_cache()
-        
